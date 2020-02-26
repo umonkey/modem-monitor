@@ -1,0 +1,769 @@
+#!/usr/bin/env python
+# vim: set tw=0:
+#
+# http://stackoverflow.com/questions/2379525/programming-huawei-e220
+# http://m2msupport.net/m2msupport/tutorial-for-huawei-modules/
+# https://wiki.archlinux.org/index.php/3G_and_GPRS_modems_with_pppd#Huawei_unsolicited_report_command_reference
+
+import datetime
+import glob
+import os
+import re
+import sys
+import time
+import traceback
+
+import serial
+
+
+ENABLE_ROAMING = False
+
+#OPERATOR_ID = 25002  # 25001=MTS-RUS, 25002=MegaFon RUS, 25011=Yota, 25020=TELE2 RU, 25099=Beeline, 25702=MTS BY
+#OPERATOR_ID = 25001  # 25001=MTS-RUS, 25002=MegaFon RUS, 25011=Yota, 25020=TELE2 RU, 25099=Beeline, 25702=MTS BY
+OPERATOR_ID = None
+
+RSSI_LOG = "~/.rssi.log"
+RSSI_LAST = "~/.rssi.last"
+MODEM_LOG = '~/modem.log.%Y%m%d'
+MODEM_LAST = os.path.expanduser("~/modem-last.txt")
+
+OPERATORS = {
+    25001: "MTS-RUS",
+    25002: "MegaFon RUS",
+    25011: "Yota",
+    25020: "TELE2 RU",
+    25099: "Beeline",
+    25701: "BY VELCOM",
+    25702: "MTS BY",
+}
+
+
+def mbit(bps):
+    return float(bps) / 1048576
+
+
+class Monitor(object):
+    RSSI_DELAY = 15
+
+    def __init__(self, path):
+        self.path = path
+
+        self.rssi = None
+        self.rssi_ts = 0
+
+        self.mode = None
+        self.bytes_in = None
+        self.bytes_out = None
+        self.roaming = None
+        self.dev_manuf = None
+        self.dev_model = None
+        self.dev_revision = None
+        self.imei = None
+        self.restricted = None
+        self.connected = None  # duration, str
+        self.data_sent = None  # str
+        self.data_rcvd = None  # str
+        self.now_dl = None
+        self.max_dl = None
+        self.now_ul = None
+        self.max_ul = None
+        self.lac = None
+        self.cellid = None
+        self.rssi_log = []
+        self.sim_status = None
+        self.can_read_sms = False
+        self.can_send_sms = False
+        self.can_read_cbs = False
+        self.simlock = None
+        self.lasterr = None
+
+        self.operator = None
+        self.oplist = {}
+        self.oplist_ts = 0
+
+        self.mlog_name = self.get_log_name()
+        self.mlog = open(self.mlog_name, 'a')
+
+        self.reopen()
+
+    def read(self):
+        line = self.f.readline(10240)
+        return line.strip()
+
+    def reopen(self):
+        self.f = None
+        self.log("opening port %s" % self.path)
+        self.f = serial.Serial(self.path, 57600, timeout=5, rtscts=True, dsrdtr=True)
+
+    def write(self, command):
+        self.log("> \033[1m%s\033[0m" % command)
+        self.f.write(command + "\r\n\r\n")
+        self.f.flush()
+
+    def log(self, message):
+        # print >> sys.stderr, "... %s" % message.strip()
+
+        fname = self.get_log_name()
+        if fname != self.mlog_name:
+            self.mlog_name = fname
+            self.mlog.close()
+            self.mlog = open(self.mlog_name, 'a')
+
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.mlog.write("%s %s\n" % (ts, message.strip()))
+        self.mlog.flush()
+
+    def get_log_name(self):
+        date = datetime.date.today()
+
+        parts = {
+            '%Y': '%04u' % date.year,
+            '%m': '%02u' % date.month,
+            '%d': '%02u' % date.day,
+        }
+
+        name = MODEM_LOG
+        for k, v in parts.items():
+            name = name.replace(k, v)
+
+        name = os.path.expanduser(name)
+
+        return name
+
+    def display(self):
+        text = ""
+        text += "Path         : %s\n" % self.path
+
+        parts = []
+        if self.dev_manuf:
+            parts.append(self.dev_manuf)
+        if self.dev_model:
+            parts.append(self.dev_model)
+        if self.dev_revision:
+            parts.append("rev. %s" % self.dev_revision)
+        if self.imei:
+            parts.append("IMEI=%s" % self.imei)
+        if not parts:
+            parts.append("no data")
+        text += "Device       : %s\n" % " ".join(parts)
+
+        lock = self.simlock or "no data"
+        text += "Device lock  : %s\n" % lock
+
+        parts = []
+        if self.rssi is None:
+            parts.append("no data")
+        elif self.rssi == 99:
+            parts.append("no signal")
+        else:
+            parts.append("%u (%d dBm)" % (self.rssi, -113 + self.rssi * 2))
+        if self.rssi_log:
+            parts.append("log: %s" % " ".join(self.rssi_log))
+        text += "RSSI         : %s\n" % ", ".join(parts)
+
+        text += "SIM status   : %s\n" % self.sim_status
+
+        parts = []
+        if self.mode:
+            parts.append(self.mode)
+        if self.roaming:
+            parts.append("roaming")
+        elif self.roaming is False:
+            parts.append("home network")
+        if self.restricted:
+            parts.append("restricted")
+        if not parts:
+            parts.append("no data")
+        if self.operator:
+            parts.append(self.operator)
+        if self.lac:    
+            parts.append("LAC: %s" % self.lac)
+        if self.cellid:
+            parts.append("CellID: %s" % self.cellid)
+        if self.can_send_sms and self.can_read_sms:
+            parts.append("+sms")
+        if self.can_read_cbs:
+            parts.append("+cb")
+        text += "Network      : %s\n" % ", ".join(parts)
+
+        parts = []
+        for k, v in sorted(self.oplist.items()):
+            parts.append("%s (%u)" % (v, k))
+        if not parts:
+            parts = ["no data"]
+        text += "Operators    : %s\n" % ", ".join(parts)
+
+        parts = []
+        if self.connected:
+            parts.append(self.connected)
+        if not parts:
+            parts.append("no data")
+        text += "Connected for: %s\n" % " ".join(parts)
+
+        parts = []
+        if self.data_rcvd:
+            parts.append("%s received" % self.data_rcvd)
+        if self.data_sent:
+            parts.append("%s sent" % self.data_sent)
+        if not parts:
+            parts.append("no data")
+        text += "Traffic      : %s\n" % ", ".join(parts)
+
+        parts = []
+        if self.now_dl:
+            parts.append("%.02f dl" % mbit(self.now_dl))
+        if self.now_ul:
+            parts.append("%.02f ul" % mbit(self.now_ul))
+        text += "Speed        : %s\n" % ", ".join(parts)
+
+        parts = []
+        if self.max_dl:
+            parts.append("%.02f dl" % mbit(self.max_dl))
+        if self.max_ul:
+            parts.append("%.02f ul" % mbit(self.max_ul))
+        text += "Top speed    : %s\n" % ", ".join(parts)
+
+        text += "Last error   : %s\n" % (self.lasterr or "none")
+        text += "Last update  : %s\n" % time.strftime("%Y-%m-%d %H:%M:%S")
+
+        print "\x1bc" + text,  # clear screen
+
+        with open(MODEM_LAST, "wb") as f:
+            f.write(text)
+
+    def offline(self):
+        pass  # do something
+
+    def set_rssi(self, rssi):
+        self.rssi_ts = time.time()
+        if rssi != self.rssi:
+            if self.rssi is not None:
+                self.rssi_log.insert(0, str(self.rssi))
+            del self.rssi_log[10:]
+
+            self.rssi = rssi
+
+            with open(os.path.expanduser(RSSI_LOG), "a") as f:
+                f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), rssi))
+
+            with open(os.path.expanduser(RSSI_LAST), "wb") as f:
+                f.write(str(rssi))
+
+    def set_mode(self, mode):
+        if self.mode != mode:
+            self.mode = mode
+            self.log("Network mode changed to %s" % mode)
+
+    def rssi_to_dbm(self, rssi):
+        if rssi is None:
+            return None
+        return -113 + rssi * 2
+
+    def on_sysinfo(self, args):
+        """Handle system status information.
+
+        Response:
+        ^SYSINFO:1,0,1,5,0,,4
+                         | |\-----
+                         |  \----- submode: no (0), gms (1), gprs (2), edge (3), wcdma (4), hsdpa (5), hsupa (6)
+                         +-------- sim status: invalid or locked (0), valid (1), none (255)
+        """
+
+        items = args.split(",")
+        for idx, v in enumerate(items):
+            if idx == 0:
+                self.restricted = False
+                if v == "0":
+                    self.log("[1] 0 = service: none")
+                elif v == "1":
+                    self.log("[1] 1 = service: restricted")
+                    self.restricted = True
+                elif v == "2":
+                    self.log("[1] 2 = service: valid")
+                elif v == "3":
+                    self.log("[1] 3 = service: restricted domain")
+                    self.restricted = True
+                elif v == "4":
+                    self.log("[1] 3 = service: power-saving")
+
+            elif idx == 1:
+                if v == "0":
+                    self.log("[2] 0 = domain: no service")
+                elif v == "1":
+                    self.log("[2] 1 = domain: only circuit switched")
+                elif v == "2":
+                    self.log("[2] 2 = domain: only packet switched")
+                elif v == "3":
+                    self.log("[2] 3 = domain: both cirquit and packet switched")
+                elif v == "4":
+                    self.log("[2] 4 = domain: searching")
+                elif v == "255":
+                    self.log("[2] 5 = domain: CDMA not supported")
+
+            elif idx == 2:
+                if v == "0":
+                    self.log("[3] 0 = home network")
+                    self.roaming = False
+                elif v == "1":
+                    self.log("[3] 1 = roaming")
+                    self.roaming = True
+
+            elif idx == 3:
+                if v == "0":
+                    self.log("[4] 0 = disconnected")
+                    self.set_mode("disconnected")
+                elif v == "1":
+                    self.log("[4] 1 = AMPS")
+                    self.set_mode("AMPS")
+                elif v == "2":
+                    self.log("[4] 2 = CDMA")
+                    self.set_mode("CDMA")
+                elif v == "3":
+                    self.log("[4] 3 = GSM/GPRS")
+                    self.set_mode("GPRS")
+                elif v == "4":
+                    self.log("[4] 4 = HDR")
+                    self.set_mode("HDR")
+                elif v == "5":
+                    self.log("[4] 5 = WCDMA")
+                    self.set_mode("WCDMA")
+                elif v == "6":
+                    self.log("[4] 6 = GPS")
+                    self.set_mode("GPRS")
+                elif v == "7":
+                    self.log("[4] 7 = GSM/WCDMA")
+                    self.set_mode("GSM/WCDMA")
+                elif v == "8":
+                    self.log("[4] 8 = CDMA/HDR")
+                    self.set_mode("CDMA/HDR")
+                elif v == "15":
+                    self.log("[4] 15 = TD-SCDMA")
+                    self.set_mode("TD-SCDMA")
+
+            elif idx == 4:
+                if v == "0":
+                    self.log("[5] 0 = sim: invalid or locked")
+                    self.sim_status = "invalid/locked"
+                elif v == "1":
+                    self.log("[5] 1 = sim: valid")
+                    self.sim_status = "valid"
+                elif v == "2":
+                    self.log("[5] 2 = sim: invalid if cs")
+                    self.sim_status = "invalid*"
+                elif v == "3":
+                    self.sim_status = "invalid*"
+                    self.log("[5] 3 = sim: invalid if ps")
+                elif v == "4":
+                    self.log("[5] 4 = sim: invalid if cs or ps")
+                    self.sim_status = "invalid*"
+                elif v == "255":
+                    self.log("[5] 255 = sim: does not exist")
+                    self.sim_status = "missing"
+
+            elif idx == 5:  # system sub mode
+                if v == "0":
+                    self.log("[6] 0 = submode: no service")
+                elif v == "1":
+                    self.log("[6] 1 = submode: GSM")
+                elif v == "2":
+                    self.log("[6] 2 = submode: GPRS")
+                elif v == "3":
+                    self.log("[6] 3 = submode: EDGE")
+                elif v == "4":
+                    self.log("[6] 4 = submode: WCDMA")
+                elif v == "5":
+                    self.log("[6] 5 = submode: HSDPA")
+                elif v == "6":
+                    self.log("[6] 6 = submode: HSUPA")
+                elif v == "7":
+                    self.log("[6] 7 = submode: HSDPA+HSUPA")
+                elif v == "8":
+                    self.log("[6] 8 = submode: TD-SCDMA")
+                elif v == "9":
+                    self.log("[6] 9 = submode: HSPA+")
+                elif v == "17":
+                    self.log("[6] 17 = submode: HSPA+(64QAM)")
+                elif v == "18":
+                    self.log("[6] 18 = submode: HSPA+(MIMO)")
+
+    def on_ussdmode(self, args):
+        if args == "1":
+            self.log("USSD mode: 1 = transparent")
+        elif args == "0":
+            self.log("USSD mode: 0 = disabled")
+
+    def on_csq(self, rssi, ber):
+        self.log("[1] RSSI = %u / %u dBm" % (int(rssi), -113 + int(rssi) * 2))
+        self.log("[2] byte error rate unknown")
+
+        self.set_rssi(int(rssi))
+
+    def on_dsflowrpt(self, args):
+        for idx, v in enumerate(args.split(",")):
+            if idx == 0:
+                dur = int(v, 16)
+                h = dur / 3600
+                m = (dur % 3600) / 60
+                s = dur % 60
+                self.connected = "%u:%02u:%02u" % (h, m, s)
+                # self.log("[1] connected for %s" % self.connected)
+
+            elif idx == 1:
+                s = int(v, 16) * 8
+                self.now_ul = s
+                self.max_ul = max(s, self.max_ul)
+                # self.log("[2] ul speed is %.2f kbps" % s)
+
+            elif idx == 2:
+                s = int(v, 16) * 8
+                self.now_dl = s
+                self.max_dl = max(s, self.max_dl)
+                # self.log("[3] dl speed is %.2f kbps" % s)
+
+            elif idx == 3:
+                self.bytes_out = int(v, 16)
+                self.data_sent = "%.2f mb" % (float(self.bytes_out) / 1048576)
+                # self.log("[4] sent %s" % self.data_sent)
+
+            elif idx == 4:
+                self.bytes_in = int(v, 16)
+                self.data_rcvd = "%.2f mb" % (float(self.bytes_in) / 1048576)
+                # self.log("[5] received %s" % self.data_rcvd)
+
+            elif idx == 5:
+                s = float(int(v, 16) * 8) / 1000
+                # self.log("[6] ul speed limit is %.2f kbps" % s)
+
+            elif idx == 6:
+                s = float(int(v, 16) * 8) / 1000
+                # self.log("[7] dl speed limit is %.2f kbps" % s)
+
+    def on_cgpaddr(self, args):
+        self.log("IP address: %s" % args)
+
+    def on_mode(self, value):
+        if value == "0,0":
+            self.set_mode("disconnected")
+        elif value == "3,1":
+            self.set_mode("GSM")
+        elif value == "3,2":
+            self.set_mode("GPRS")
+        elif value == "3,3":
+            self.set_mode("EDGE")
+        elif value == "5,4":
+            self.set_mode("ECDMA")
+        elif value == "5,5":
+            self.set_mode("HSDPA")
+        elif value == "5,6":
+            self.set_mode("HSUPA")
+        elif value == "5,7":
+            self.set_mode("HSDPA+HSUPA")
+        else:
+            self.log("Mode unknown: %s" % value)
+
+    def on_rssi(self, value):
+        self.set_rssi(int(value))
+
+    def on_cops(self, args):
+        for idx, v in enumerate(args.split(",")):
+            if idx == 2:
+                v = v.strip('"')
+                if v.isdigit():
+                    self.operator = OPERATORS.get(int(v))
+                else:
+                    self.operator = v
+
+    def on_cops_list(self, args):
+        """Handle the operator list.
+
+        Example command: +COPS: (1,"MegaFon RUS","MegaFon","25002",2),(2,"MTS BY","MTS","25702",2),(1,"MTS-RUS","MTS","25001",2),(1,"TELE2 RU","TELE2 RU","25020",2),,(0,1,2,3,4),(0,1,2)
+        Meaning: (status, symbolic name, display name, code, hz)
+        Status: 1 = available, 2 = current (connected).
+        """
+        self.operator = None
+        self.oplist = {}
+
+        for item in re.findall(r'\([^)]+\)', args):
+            parts = item[1:-2].split(",")
+            for idx, v in enumerate(parts):
+                if idx == 0 and int(v) == 1:
+                    name = parts[1].strip('"')
+                    code = int(parts[3].strip('"'))
+                    self.oplist[code] = name
+
+                elif idx == 0 and int(v) == 2:
+                    name = parts[1].strip('"')
+                    code = int(parts[3].strip('"'))
+                    self.oplist[code] = name
+                    self.operator = name
+
+        self.oplist_ts = time.time()
+
+    def on_creg(self, args):
+        # http://m2msupport.net/m2msupport/atcreg-network-registration/
+        for idx, v in enumerate(args.split(",")):
+            if idx == 0:
+                if v == "0":
+                    self.log("Not registered, not searching.")
+                elif v == "1":
+                    self.log("Registered with home network.")
+                elif v == "2":
+                    self.log("Not registered, searching...")
+                elif v == "3":
+                    self.log("Registration denied.")
+                elif v == "5":
+                    self.log("Registered, roaming.")
+                elif v == "6":
+                    self.log("Registered with home network, SMS only.")
+                elif v == "7":
+                    self.log("Registered, roaming, SMS only.")
+                elif v == "8":
+                    self.log("Registered for emergency only.")
+
+            elif idx == 1:
+                if v == "0":
+                    self.set_mode('GSM')
+                    #self.log("Mode: GSM")
+                elif v == "1":
+                    self.log("Mode: GSM Compact")
+                elif v == "2":
+                    self.log("Mode: UTRAN")
+                elif v == "3":
+                    self.log("Mode: GSM +EGPRS")
+                elif v == "4":
+                    self.log("Mode: UTRAN +HSDPA")
+                elif v == "5":
+                    self.log("Mode: UTRAN +HSUPA")
+                elif v == "6":
+                    self.log("Mode: UTRAN +HSDPA +HSUPA")
+                elif v == "7":
+                    self.log("Mode: E-UTRAN")
+
+            elif idx == 2:
+                self.lac = v
+
+            elif idx == 3:
+                self.cellid = v
+
+    def on_cmgf(self, value):
+        if value == "0":
+            self.log("SMS in PDU mode")
+        elif value == "1":
+            self.log("SMS in text mode")
+
+    def on_csms(self, value):
+        """Check if device supports SMS.
+        http://www.developershome.com/sms/checkCommandSupport2.asp
+        """
+        parts = value.split(",")
+        for idx, v in enumerate(parts):
+            if idx == 1:
+                self.can_read_sms = v == "1"
+            elif idx == 2:
+                self.can_send_sms = v == "1"
+            elif idx == 3:
+                self.can_read_cbs = v == "1"
+
+    def on_cnmi(self, value):
+        parts = value.split(",")
+        for idx, v in enumerate(parts):
+            if idx == 0:  # <mode>
+                pass  # 0 = buffer, 1 = direct, direct|buffer
+            elif idx == 1:  # <mt>
+                pass  # 
+                self.can_send_sms = v == "1"
+            elif idx == 2:  # <bm>
+                v = int(v)
+                self.can_read_cbs = v > 0
+            elif idx == 3:  # <ds>
+                pass
+            elif idx == 4:  # <bfr>
+                pass
+
+    def on_model(self, value):
+        self.dev_model = value
+
+    def on_manuf(self, value):
+        self.dev_manuf = value
+
+    def on_imei(self, value):
+        self.imei = value
+
+    def on_revision(self, value):
+        self.dev_revision = value
+
+    def on_cardlock(self, v1, v2, v3):
+        if v1 == "2":
+            self.simlock = "unlocked"
+        elif v1 == "3":
+            self.simlock = "dead locked"
+        elif v1 == "1":
+            self.simlock = "locked, %s attempts left" % v2
+
+    def monitor(self):
+        command_queue = []
+
+        # Enable echo.
+        command_queue.append("ATE0")
+
+        command_queue.append("ATI")
+
+        # Enable extended error report.
+        command_queue.append("AT+CMEE=2")
+
+        command_queue.append("AT^SYSINFO")
+        command_queue.append("AT^CARDLOCK?")
+
+        # Enable unsolicited registration info: status, location etc.
+        command_queue.append("AT+CREG=2")
+
+        if ENABLE_ROAMING:
+            command_queue.append("AT^SYSCFG=14,2,3fffffff,2,1")
+        else:
+            command_queue.append("AT^SYSCFG=14,2,3fffffff,0,1")
+
+        command_queue.append("AT^SYSCFGEX=\"03\",3fffffff,2,4,7fffffffffffffff,,")
+        command_queue.append("AT^SYSCFGEX?")
+
+        command_queue.append("AT+CGDCONT?")
+        command_queue.append("AT^HSDPA=1")
+        command_queue.append("AT^HSUPA=1")
+        command_queue.append("AT^HSPA=3")
+
+        # Register with the network.
+        # Automatic: AT+COPS=0
+        # Manual: AT+COPS=1,2,25002,2
+        # Deregister: AT+COPS=2
+        if OPERATOR_ID:
+            command_queue.append("AT+COPS=1,2,\"%u\",2" % OPERATOR_ID)
+        else:
+            command_queue.append("AT+COPS=0")
+
+        # https://github.com/thedumbtechguy/USSD-PDU-Converters/blob/master/Converter.php
+        command_queue.append("AT+CUSD=1,\"AA184C3602\",15")  # *102#
+
+        command_queue.append("AT+CGATT?")  # attached to the network?
+        command_queue.append("AT+CR?")
+        command_queue.append("AT+COPS?")  # query COPS mode
+        command_queue.append("AT^CURC=1")  # enable unsolicited messages
+        command_queue.append("AT+CMGF?")
+        command_queue.append("AT+CSMS?")  # query sms support
+        command_queue.append("AT^USSDMODE?")  # query USSD support
+        command_queue.append("AT^CHIPTEMP?")
+        command_queue.append("AT^THERMFUN?")
+        command_queue.append("AT^DVCFG?")
+        command_queue.append("AT^IPFLOWQ?")
+        command_queue.append("AT+CGPADDR=1")
+
+        #command_queue.append("AT+CMGF?")    # query SMS mode
+        #command_queue.append("AT+CMGF=1")   # set SMS mode to text
+        #command_queue.append("AT^HCMGL=?")  # list SMS messages
+
+        command_queue.append("AT+CREG?")
+        command_queue.append("AT+CSQ")
+        command_queue.append("AT+COPS=?")  # query operator list
+        command_queue.append("AT+CNMI?")  # query operator list
+
+        handlers = [(r'^\^SYSINFO:(.*)', self.on_sysinfo),
+                    (r'^\^USSDMODE: (\d+)$', self.on_ussdmode),
+                    (r'^\+CSQ: (\d+),(\d+)$', self.on_csq),
+                    (r'^\^DSFLOWRPT:([0-9A-F,]+)$', self.on_dsflowrpt),
+                    (r'^\+CGPADDR: 1,"([0-9.]+)"$', self.on_cgpaddr),
+                    (r'^\^MODE:([0-9,]+)$', self.on_mode),
+                    (r'^\^RSSI: (\d+)$', self.on_rssi),
+                    (r'^\+CREG: ([0-9,]+)$', self.on_creg),
+                    (r'^\+CMGF: (\d+)$', self.on_cmgf),
+                    (r'^\+CSMS: (.+)$', self.on_csms),
+                    (r'^\+CNMI: (.+)$', self.on_cnmi),
+                    (r'^Model: (.+)$', self.on_model),
+                    (r'^Manufacturer: (.+)$', self.on_manuf),
+                    (r'^IMEI: (.+)$', self.on_imei),
+                    (r'^Revision: (.+)$', self.on_revision),
+                    (r'^\+COPS: (\(.+\))$', self.on_cops_list),  # +COPS: 0,0,"MTS BY",2
+                    (r'^\+COPS: (.+)$', self.on_cops),  # +COPS: 0,0,"MTS BY",2
+                    (r'^\^CARDLOCK: (\d+),(\d+),(\d+)$', self.on_cardlock),
+                    ]
+
+        ready = True  # got OK, can send next command
+
+        self.display()
+
+        while True:
+            try:
+                line = self.read()
+            except Exception, e:
+                self.log("ERROR: %s" % e)
+                self.lasterr = str(e)
+                self.display()
+                self.reopen()
+                break  # exit and restart
+
+            if line:
+                self.log("< %s" % line)
+                if re.match(r'^(OK|COMMAND NOT SUPPORT|ERROR|\+CME ERROR: .+)$', line):
+                    ready = True
+
+            for pattern, handler in handlers:
+                m = re.match(pattern, line)
+                if m:
+                    handler(*m.groups())
+                    break
+
+            if not command_queue and time.time() - self.rssi_ts > self.RSSI_DELAY:
+                command_queue.append("AT+CSQ")
+                command_queue.append("AT^SYSINFO")
+                command_queue.append("AT+COPS?")  # query operator list
+                command_queue.append("AT+CREG?")  # network status
+
+            if command_queue and ready:
+                self.write(command_queue[0])
+                del command_queue[0]
+                ready = False
+
+            if line:
+                self.display()
+
+
+def try_once(real_paths):
+    try:
+        paths = real_paths
+        if not paths:
+            paths += sorted(glob.glob("/dev/ttyUSB*"), reverse=True)
+
+        if not paths:
+            print "No devices."
+            return
+
+        for path in paths:
+            if os.path.exists(path):
+                try:
+                    print "Using device %s" % path
+                    mon = Monitor(path)
+                    while True:
+                        mon.monitor()
+                    return
+                except serial.SerialException, e:
+                    print "Device %s not available: %s" % (path, e)
+        print "No devices to monitor."
+    except Exception, e:
+        print "Error:", e
+        print traceback.format_exc()
+    finally:
+        pass
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["compress-log"]:
+        RSSILogger.compress(RSSI_LOG)
+        exit(0)
+
+    try:
+        paths = sys.argv[1:]
+        while True:
+            try:
+                try_once(paths)
+            except KeyboardInterrupt:
+                print "Restarting in 5 seconds..."
+            time.sleep(5)
+    finally:
+        pass
