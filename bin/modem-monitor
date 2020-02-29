@@ -38,6 +38,16 @@ OPERATORS = {
 }
 
 
+def find_device():
+    files = glob.glob('/sys/bus/usb-serial/drivers/option1/ttyUSB*')
+    ids = [int(os.path.basename(f)[6:]) for f in files]
+    if ids:
+        ids.sort()
+        return '/dev/ttyUSB%d' % ids[-1]
+    else:
+        return None
+
+
 def mbit(bps):
     return float(bps) / 1048576
 
@@ -48,13 +58,27 @@ class Monitor(object):
     def __init__(self, path):
         self.path = path
 
+        # List of supported commands, obtained by CLAC.
+        self.at_commands = []
+
+        # Command queue: (send, expect, handler).
+        self.command_queue = []
+
+        # Command being processed.  Moved here from the queue after being sent out.
+        self.current_command = None
+
+        # Response queue.
+        self.response_queue = []
+
         self.rssi = None
         self.rssi_ts = 0
+
+        self.registered = False
+        self.registered_text = None
 
         self.mode = None
         self.bytes_in = None
         self.bytes_out = None
-        self.roaming = None
         self.dev_manuf = None
         self.dev_model = None
         self.dev_revision = None
@@ -70,11 +94,11 @@ class Monitor(object):
         self.lac = None
         self.cellid = None
         self.rssi_log = []
+        self.simlock = None
         self.sim_status = None
         self.can_read_sms = False
         self.can_send_sms = False
         self.can_read_cbs = False
-        self.simlock = None
         self.lasterr = None
 
         self.operator = None
@@ -164,19 +188,11 @@ class Monitor(object):
         text += "SIM status   : %s\n" % self.sim_status
 
         parts = []
-        if self.mode:
-            parts.append(self.mode)
-        if self.roaming:
-            parts.append("roaming")
-        elif self.roaming is False:
-            parts.append("home network")
-        if self.restricted:
-            parts.append("restricted")
-        if not parts:
-            parts.append("no data")
+        if self.registered_text:
+            parts.append(self.registered_text)
         if self.operator:
             parts.append(self.operator)
-        if self.lac:    
+        if self.lac:
             parts.append("LAC: %s" % self.lac)
         if self.cellid:
             parts.append("CellID: %s" % self.cellid)
@@ -233,6 +249,19 @@ class Monitor(object):
 
     def offline(self):
         pass  # do something
+
+    def set_registered(self, registered, text):
+        self.registered_text = text
+
+        if registered and self.registered == False:
+            self.registered = True
+
+            # Request balance.
+            self.queue('AT+CUSD=1,"AA184C3602",15', None, self.on_dummy, '+CUSD')
+
+        elif self.registered and not registered:
+            self.registered = False
+            self.queue('AT+COPS?', None, self.on_cops, '+COPS')  # query operators
 
     def set_rssi(self, rssi):
         self.rssi_ts = time.time()
@@ -499,52 +528,6 @@ class Monitor(object):
 
         self.oplist_ts = time.time()
 
-    def on_creg(self, args):
-        # http://m2msupport.net/m2msupport/atcreg-network-registration/
-        for idx, v in enumerate(args.split(",")):
-            if idx == 0:
-                if v == "0":
-                    self.log("Not registered, not searching.")
-                elif v == "1":
-                    self.log("Registered with home network.")
-                elif v == "2":
-                    self.log("Not registered, searching...")
-                elif v == "3":
-                    self.log("Registration denied.")
-                elif v == "5":
-                    self.log("Registered, roaming.")
-                elif v == "6":
-                    self.log("Registered with home network, SMS only.")
-                elif v == "7":
-                    self.log("Registered, roaming, SMS only.")
-                elif v == "8":
-                    self.log("Registered for emergency only.")
-
-            elif idx == 1:
-                if v == "0":
-                    self.set_mode('GSM')
-                    #self.log("Mode: GSM")
-                elif v == "1":
-                    self.log("Mode: GSM Compact")
-                elif v == "2":
-                    self.log("Mode: UTRAN")
-                elif v == "3":
-                    self.log("Mode: GSM +EGPRS")
-                elif v == "4":
-                    self.log("Mode: UTRAN +HSDPA")
-                elif v == "5":
-                    self.log("Mode: UTRAN +HSUPA")
-                elif v == "6":
-                    self.log("Mode: UTRAN +HSDPA +HSUPA")
-                elif v == "7":
-                    self.log("Mode: E-UTRAN")
-
-            elif idx == 2:
-                self.lac = v
-
-            elif idx == 3:
-                self.cellid = v
-
     def on_cmgf(self, value):
         if value == "0":
             self.log("SMS in PDU mode")
@@ -580,18 +563,6 @@ class Monitor(object):
             elif idx == 4:  # <bfr>
                 pass
 
-    def on_model(self, value):
-        self.dev_model = value
-
-    def on_manuf(self, value):
-        self.dev_manuf = value
-
-    def on_imei(self, value):
-        self.imei = value
-
-    def on_revision(self, value):
-        self.dev_revision = value
-
     def on_cardlock(self, v1, v2, v3):
         if v1 == "2":
             self.simlock = "unlocked"
@@ -600,22 +571,236 @@ class Monitor(object):
         elif v1 == "1":
             self.simlock = "locked, %s attempts left" % v2
 
+    def queue(self, command, expect, handler, need=None):
+        """Queue a command.
+
+        The command will be sent to the device when the incoming buffer is empty (i.e., previous command finished).
+        Then the output will be collected, until the expect string is received.
+        Then the handler will be called with all received lines.
+        """
+        if expect is None:
+            expect = ('OK', 'ERROR')
+        elif isinstance(expect, str):
+            expect = (expect, )
+
+        if handler is None:
+            handler = self.on_dummy
+
+        if need is not None and need not in self.at_commands:
+            self.log('command %s not supported -- not sending' % command)
+            return  # command not supported
+
+        self.command_queue.append((command, expect, handler))
+
+    def on_ati(self, lines):
+        """Handle ATI: device info."""
+        for line in lines:
+            if ':' not in line:
+                self.log('bad ati response: %s' % line)
+                continue
+
+            (k, v) = line.split(': ', 1)
+            if k == 'Manufacturer':
+                self.dev_manuf = v
+                self.log('device manufacturer: %s' % v)
+            elif k == 'Model':
+                self.dev_model = v
+                self.log('device model: %s' % v)
+            elif k == 'IMEI':
+                self.imei = v
+                self.log('device imei: %s' % v)
+            elif k == 'Revision':
+                self.dev_revision = v
+                self.log('device revision: %s' % v)
+            elif k == '+GCAP':
+                self.log('device capabilities: %s' % v)
+
+    def on_cgdcont(self, lines):
+        self.log('That was the APN list.')
+
+    def on_clac(self, lines):
+        """Handle CLAC: list of supported commands."""
+        self.at_commands = lines
+        self.log('Updated the list of supported commands.')
+
+        self.go_ahead()
+
+    def on_creg(self, lines):
+        """Handle +CREG: registration status.
+        http://m2msupport.net/m2msupport/atcreg-network-registration/
+        """
+        for line in lines:
+            if line.startswith('+CREG: '):
+                args = line[7:].split(',')
+                for idx, v in enumerate(args):
+                    if idx == 0:
+                        smode = None
+                        connected = False
+
+                        if v == '0':
+                            smode = 'idle'
+                        elif v == '1':
+                            smode = 'registered'
+                            connected = True
+                        elif v == '2':
+                            smode = 'searching'
+                        elif v == '3':
+                            smode = 'denied'
+                        elif v == '4':
+                            smode = 'unknown'
+                        elif v == '5':
+                            smode = 'roaming'
+                            connected = True
+                        elif v == '6':
+                            smode = 'sms-only'
+                            connected = True
+                        elif v == '7':
+                            smode = 'roaming, sms-only'
+                            connected = True
+                        elif v == '8':
+                            smode = 'emergency'
+                            connected = True
+
+                        self.set_registered(connected, smode)
+
+                    elif idx == 1:
+                        mode = None
+
+                        if v == '0':
+                            mode = 'GSM'
+                        elif v == '1':
+                            mode = 'GSM Compact'
+                        elif v == '2':
+                            mode = 'UTRAN'
+                        elif v == '3':
+                            mode = 'EGPRS'
+                        elif v == '4':
+                            mode = 'UTRAN +HSDPA'
+                        elif v == '5':
+                            mode = 'UTRAN +HSUPA'
+                        elif v == '6':
+                            mode = 'UTRAN +HSDPA +HSUPA'
+                        elif v == '7':
+                            mode = 'E-UTRAN'
+                        else:
+                            mode = 'unknown'
+
+                        self.mode = mode
+
+                    elif idx == 2:
+                        self.lac = v
+
+                    elif idx == 3:
+                        self.cellid = v
+
+        self.log('Network status updated.')
+
+    def on_dummy(self, lines):
+        self.log('Response ignored.')
+
+    def on_echo_off(self, lines):
+        self.log('echo turned off')
+
+    def on_unsolicited(self, line):
+        """Handle unsolicited responses: status change, etc."""
+
+        for m in re.findall(r'^\+ZOPERTER: ', line):
+            # Ping the idle link.
+            self.queue('AT', None, self.on_dummy)
+            return
+
+    def on_zsec(self, lines):
+        for line in lines:
+            for m in re.findall(r'^\+ZSEC: (\d+),(\d+)$', line):
+                for idx, v in enumerate(m):
+                    if idx == 0:
+                        pass
+
+                    elif idx == 1:
+                        locked = "unlocked"
+
+                        if v == '1':
+                            self.log('Network locked.')
+                            locked = 'network'
+                        elif v == '2':
+                            self.log('SIM locked')
+                            locked = 'sim'
+                        elif v == '3':
+                            self.log('SIM and network locked')
+                            locked = 'sim, network'
+
+                        self.simlock = locked
+
+    def go_ahead(self):
+        """Send initial commands."""
+        self.queue('ATE0', 'OK', self.on_echo_off)
+        self.queue('ATI', 'OK', self.on_ati)
+        self.queue('AT+CGDCONT?', 'OK', self.on_cgdcont, '+CGDCONT')
+
+        # Enable unsolicited registration info: status, location etc.
+        self.queue('AT+CREG=2', 'OK', self.on_dummy, '+CREG')
+
+        # Check SIM lock.
+        self.queue('AT+ZSEC?', None, self.on_zsec, '+ZTEST')
+
+        # Enable all operators.
+        self.queue('AT+COPS=0', None, self.on_dummy, '+COPS')
+
+        # Prefer 3G.
+        self.queue('AT+ZSNT=2,0,0', None, self.on_dummy, '+ZTEST')
+        self.queue('AT+ZPAS?', None, None, '+ZTEST')
+        self.queue('AT^SYSCFG=14,2,3fffffff,0,1', None, self.on_dummy, '^SYSCFG')
+
+        # Manual registration:
+        #self.queue('AT+COPS=1,2,"25001",2', None, self.on_dummy, '+COPS')
+
+        # Request registration status.
+        self.queue('AT+CREG?', None, self.on_creg, '+CREG')
+
+    def handle_input(self):
+        """Wait for one line, handle it, then return."""
+        if self.current_command is None and self.command_queue:
+            cmd = self.command_queue[0]
+            del self.command_queue[0]
+
+            self.write(cmd[0])
+            self.current_command = cmd
+
+        line = self.read()
+        if line:
+            self.log("< %s" % line)
+
+            if self.current_command is not None:
+                if line == '+CME ERROR: 10':
+                    self.log('Error: SIM card not inserted')
+
+                # Handle expected response.
+                if line in self.current_command[1] or line.startswith('+CME ERROR: '):  # OK, ERROR, etc.
+                    result = self.response_queue
+                    self.response_queue = []
+                    self.current_command[2](result)
+                    self.current_command = None
+                else:
+                    self.response_queue.append(line)
+
+            else:
+                # Handle unsolicited response.
+                pass
+
     def monitor(self):
+        self.queue('AT+CLAC', ('OK',), self.on_clac)
+
+        while True:
+            self.display()
+            self.handle_input()
+
         command_queue = []
-
-        # Enable echo.
-        command_queue.append("ATE0")
-
-        command_queue.append("ATI")
 
         # Enable extended error report.
         command_queue.append("AT+CMEE=2")
 
         command_queue.append("AT^SYSINFO")
         command_queue.append("AT^CARDLOCK?")
-
-        # Enable unsolicited registration info: status, location etc.
-        command_queue.append("AT+CREG=2")
 
         if ENABLE_ROAMING:
             command_queue.append("AT^SYSCFG=14,2,3fffffff,2,1")
@@ -625,19 +810,9 @@ class Monitor(object):
         command_queue.append("AT^SYSCFGEX=\"03\",3fffffff,2,4,7fffffffffffffff,,")
         command_queue.append("AT^SYSCFGEX?")
 
-        command_queue.append("AT+CGDCONT?")
         command_queue.append("AT^HSDPA=1")
         command_queue.append("AT^HSUPA=1")
         command_queue.append("AT^HSPA=3")
-
-        # Register with the network.
-        # Automatic: AT+COPS=0
-        # Manual: AT+COPS=1,2,25002,2
-        # Deregister: AT+COPS=2
-        if OPERATOR_ID:
-            command_queue.append("AT+COPS=1,2,\"%u\",2" % OPERATOR_ID)
-        else:
-            command_queue.append("AT+COPS=0")
 
         # https://github.com/thedumbtechguy/USSD-PDU-Converters/blob/master/Converter.php
         command_queue.append("AT+CUSD=1,\"AA184C3602\",15")  # *102#
@@ -659,7 +834,6 @@ class Monitor(object):
         #command_queue.append("AT+CMGF=1")   # set SMS mode to text
         #command_queue.append("AT^HCMGL=?")  # list SMS messages
 
-        command_queue.append("AT+CREG?")
         command_queue.append("AT+CSQ")
         command_queue.append("AT+COPS=?")  # query operator list
         command_queue.append("AT+CNMI?")  # query operator list
@@ -671,14 +845,9 @@ class Monitor(object):
                     (r'^\+CGPADDR: 1,"([0-9.]+)"$', self.on_cgpaddr),
                     (r'^\^MODE:([0-9,]+)$', self.on_mode),
                     (r'^\^RSSI: (\d+)$', self.on_rssi),
-                    (r'^\+CREG: ([0-9,]+)$', self.on_creg),
                     (r'^\+CMGF: (\d+)$', self.on_cmgf),
                     (r'^\+CSMS: (.+)$', self.on_csms),
                     (r'^\+CNMI: (.+)$', self.on_cnmi),
-                    (r'^Model: (.+)$', self.on_model),
-                    (r'^Manufacturer: (.+)$', self.on_manuf),
-                    (r'^IMEI: (.+)$', self.on_imei),
-                    (r'^Revision: (.+)$', self.on_revision),
                     (r'^\+COPS: (\(.+\))$', self.on_cops_list),  # +COPS: 0,0,"MTS BY",2
                     (r'^\+COPS: (.+)$', self.on_cops),  # +COPS: 0,0,"MTS BY",2
                     (r'^\^CARDLOCK: (\d+),(\d+),(\d+)$', self.on_cardlock),
@@ -713,7 +882,6 @@ class Monitor(object):
                 command_queue.append("AT+CSQ")
                 command_queue.append("AT^SYSINFO")
                 command_queue.append("AT+COPS?")  # query operator list
-                command_queue.append("AT+CREG?")  # network status
 
             if command_queue and ready:
                 self.write(command_queue[0])
@@ -724,27 +892,12 @@ class Monitor(object):
                 self.display()
 
 
-def try_once(real_paths):
+def try_once(device_path):
     try:
-        paths = real_paths
-        if not paths:
-            paths += sorted(glob.glob("/dev/ttyUSB*"), reverse=True)
-
-        if not paths:
-            print "No devices."
-            return
-
-        for path in paths:
-            if os.path.exists(path):
-                try:
-                    print "Using device %s" % path
-                    mon = Monitor(path)
-                    while True:
-                        mon.monitor()
-                    return
-                except serial.SerialException, e:
-                    print "Device %s not available: %s" % (path, e)
-        print "No devices to monitor."
+        mon = Monitor(device_path)
+        while True:
+            mon.monitor()
+        return
     except Exception, e:
         print "Error:", e
         print traceback.format_exc()
@@ -758,12 +911,15 @@ if __name__ == "__main__":
         exit(0)
 
     try:
-        paths = sys.argv[1:]
         while True:
             try:
-                try_once(paths)
+                device = find_device()
+                if device is None:
+                    print 'Modem device not found.'
+                else:
+                    try_once(device)
             except KeyboardInterrupt:
-                print "Restarting in 5 seconds..."
-            time.sleep(5)
+                print "Restarting in a second..."
+            time.sleep(1)
     finally:
         pass
