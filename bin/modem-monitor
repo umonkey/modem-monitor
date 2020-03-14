@@ -232,8 +232,6 @@ class Monitor(object):
         text += "SIM status   : %s\n" % ', '.join(parts)
 
         parts = []
-        if self.registered_text:
-            parts.append(self.registered_text)
         if self.operator:
             parts.append(self.operator)
         if self.lac:
@@ -581,16 +579,25 @@ class Monitor(object):
     def on_rssi_unsolicited(self, value):
         self.set_rssi(int(value))
 
-    def on_cops(self, args):
-        for idx, v in enumerate(args.split(",")):
-            if idx == 2:
-                v = v.strip('"')
-                if v.isdigit():
-                    self.operator = OPERATORS.get(int(v))
-                else:
-                    self.operator = v
+    def on_cops(self, lines):
+        """Operator list response.
 
-    def on_cops_list(self, args):
+        > AT+COPS?
+        < +COPS: 0,0,"MTS BY",2
+        """
+        if lines[0].startswith('+COPS: ('):
+            return self.on_cops_list(lines)
+
+        m = re.match(r'^\+COPS: (.+)$', lines[0])
+        if m is not None:
+            cells = m.group(1).split(',')
+            value = cells[2]
+            if value.isdigit():
+                self.operator = OPERATORS.get(int(value))
+            else:
+                self.operator = value.strip('"')
+
+    def on_cops_list(self, lines):
         """Handle the operator list.
 
         Example command: +COPS: (1,"MegaFon RUS","MegaFon","25002",2),(2,"MTS BY","MTS","25702",2),(1,"MTS-RUS","MTS","25001",2),(1,"TELE2 RU","TELE2 RU","25020",2),,(0,1,2,3,4),(0,1,2)
@@ -823,7 +830,11 @@ class Monitor(object):
         self.queue('AT+ZSEC?', None, self.on_zsec, '+ZTEST')
 
         # Enable all operators.
+        self.log('Enabling all operators...')
         self.queue('AT+COPS=0', None, self.on_dummy, '+COPS')
+
+        self.log('Requesting operator list...')
+        self.queue('AT+COPS?', None, self.on_cops, '+COPS')  # query operators
 
         # Prefer 3G.
         self.queue('AT+ZSNT=2,0,0', None, self.on_dummy, '+ZTEST')

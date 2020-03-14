@@ -23,7 +23,7 @@ Device       : huawei E3131 rev. 21.158.13.00.209 IMEI=353101043024719
 Device lock  : unlocked
 RSSI / RSCP  : -95 / -91 dBm, ECIO = -3 dBm :), RSSI=9
 SIM status   : valid, data only
-Network      : searching, CellID: 8160072, +sms, +cb, WCDMA / HSPA+
+Network      : MegaFon, CellID: 8160074, +sms, +cb, WCDMA / HSPA+
 Operators    : no data
 Connected for: 7:09:58 IP address: 100.127.194.46
 Traffic      : 1490.83 mb received, 2496.47 mb sent
