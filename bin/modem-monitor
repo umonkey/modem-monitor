@@ -195,28 +195,22 @@ class Monitor(object):
         lock = self.simlock or "no data"
         text += "Device lock  : %s\n" % lock
 
+        dbm = lambda value: 'no data' if value is None else '%4d dBm' % value
+
+        parts = []
+        parts.append('RSSI = %8s' % dbm(None if self.rssi is None else -113 + self.rssi * 2))
+        parts.append('RSCP = %8s' % dbm(self.rscp))
+        parts.append('ECIO = %8s' % dbm(-self.ecio if self.ecio is not None else None))
+        text += "Signal level : %s\n" % ", ".join(parts)
+
         parts = []
         if self.rssi is None:
-            parts.append("no data")
-        elif self.rssi == 99:
-            parts.append("no signal")
-        elif self.rssi and self.rscp:
-            parts.append('%d / %d dBm' % (-113 + self.rssi * 2, self.rscp))
-        elif self.rssi:
-            parts.append('%d dBm' % (-113 + self.rssi * 2))
-        if self.ecio is None:
-            pass
-        elif self.ecio <= 6:
-            parts.append('ECIO = %d dBm :)' % -self.ecio)
-        elif self.ecio <= 10:
-            parts.append('ECIO = %d dBm' % -self.ecio)
-        elif self.ecio:
-            parts.append('ECIO = %d dBm :(' % -self.ecio)
-        if self.rssi:
-            parts.append('RSSI=%d' % self.rssi)
+            parts.append('no data')
+        else:
+            parts.append('%d' % self.rssi)
         if self.rssi_log:
             parts.append("log: %s" % " ".join(self.rssi_log))
-        text += "RSSI / RSCP  : %s\n" % ", ".join(parts)
+        text += "RSSI         : %s\n" % ", ".join(parts)
 
         parts = []
         if self.sim_status:
@@ -418,6 +412,9 @@ class Monitor(object):
             self.set_ecio(int(m.group(2)))
             self.set_rssi(int(m.group(3)))
             self.set_cellid(str(m.group(5)))
+        else:
+            self.rssi_ts = time.time()
+            self.log("bad anquery response")
 
     def on_sysinfo(self, lines):
         """Handle system status information.
@@ -819,7 +816,8 @@ class Monitor(object):
         self.queue('AT+CMEE=2')
         self.queue('AT+CGDCONT?', 'OK', self.on_cgdcont, '+CGDCONT')
         self.queue('AT^CARDLOCK?', None, self.on_cardlock, '^CARDLOCK')
-        self.queue('AT^SYSINFO', None, self.on_sysinfo, '^SYSINFO')
+        self.queue('AT^SYSINFO', None, self.on_sysinfo)
+        self.queue('AT^SYSINFOEX', None, self.on_sysinfo)
         self.queue('AT^SYSCFG?')
 
         # Enable unsolicited registration info: status, location etc.
@@ -873,6 +871,12 @@ class Monitor(object):
         if '+CGPADDR' in self.at_commands:
             self.queue('AT+CGPADDR=1', None, self.on_cgpaddr)
 
+        if '^SYSINFO' in self.at_commands:
+            self.queue('AT^SYSINFO', None, self.on_sysinfo)
+
+        if '^SYSINFOEX' in self.at_commands:
+            self.queue('AT^SYSINFOEX', None, self.on_dummy)
+
     def handle_input(self):
         """Wait for one line, handle it, then return."""
         if self.current_command is None and self.command_queue:
@@ -889,6 +893,7 @@ class Monitor(object):
             if self.current_command is not None:
                 if line == '+CME ERROR: 10':
                     self.log('Error: SIM card not inserted')
+                    self.sim_status = 'missing'
 
                 # Handle expected response.
                 if line in self.current_command[1] or line.startswith('+CME ERROR: '):  # OK, ERROR, etc.
@@ -934,15 +939,10 @@ if __name__ == "__main__":
         exit(0)
 
     try:
-        while True:
-            try:
-                device = find_device()
-                if device is None:
-                    print 'Modem device not found.'
-                else:
-                    try_once(device)
-            except KeyboardInterrupt:
-                print "Restarting in a second..."
-            time.sleep(1)
-    finally:
-        unset_title()
+        device = find_device()
+        if device is None:
+            print 'Modem device not found.'
+        else:
+            try_once(device)
+    except KeyboardInterrupt:
+        print "Restarting in a second..."
