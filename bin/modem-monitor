@@ -126,6 +126,8 @@ class Monitor(object):
         self.oplist = {}
         self.oplist_ts = 0
 
+        self.have_hcsq = False
+
         self.mlog_name = self.get_log_name()
         self.mlog = open(self.mlog_name, 'a')
 
@@ -198,7 +200,7 @@ class Monitor(object):
         dbm = lambda value: 'no data' if value is None else '%4d dBm' % value
 
         parts = []
-        parts.append('RSSI = %8s' % dbm(None if self.rssi is None else -113 + self.rssi * 2))
+        parts.append('RSSI = %8s' % dbm(self.get_rssi_dbm()))
         parts.append('RSCP = %8s' % dbm(self.rscp))
         parts.append('ECIO = %8s' % dbm(-self.ecio if self.ecio is not None else None))
         text += "Signal level : %s\n" % ", ".join(parts)
@@ -237,9 +239,9 @@ class Monitor(object):
         if self.can_read_cbs:
             parts.append("+cb")
         if self.srv_mode and self.srv_submode:
-            parts.append('%s / %s' % (self.srv_mode, self.srv_submode))
+            parts.append('%s / %s' % (self.get_srv_mode(), self.get_srv_submode()))
         elif self.srv_mode:
-            parts.append(self.srv_mode)
+            parts.append(self.get_srv_mode())
         text += "Network      : %s\n" % ", ".join(parts)
 
         parts = []
@@ -316,11 +318,11 @@ class Monitor(object):
 
         https://wiki.teltonika-networks.com/view/EC/IO
         """
-        assert(type(ecio) == int)
+        assert(type(ecio) == float)
 
         if self.ecio != ecio:
             self.ecio = ecio
-            self.log('ECIO changed to %d' % ecio)
+            self.log('ECIO changed to %.1f' % ecio)
 
     def set_registered(self, registered, text):
         self.registered_text = text
@@ -341,6 +343,9 @@ class Monitor(object):
             self.log('RSCP changed to %d dBm' % rscp)
 
     def set_rssi(self, rssi):
+        assert(type(rssi) == int)
+        assert(rssi >= 0)
+
         self.rssi_ts = time.time()
         if rssi != self.rssi:
             if self.rssi is not None:
@@ -357,19 +362,51 @@ class Monitor(object):
             with open(os.path.expanduser(RSSI_LAST), "wb") as f:
                 f.write(str(rssi))
 
+    def get_rssi(self):
+        if self.rssi is None:
+            return None
+        elif self.rssi < 0:
+            return (113 - self.rssi) / 2
+        else:
+            return self.rssi
+
+    def get_rssi_dbm(self):
+        if self.rssi is None:
+            return None
+        elif self.rssi < 0:
+            return self.rssi
+        else:
+            return -113 + self.rssi * 2
+
+    def set_sinr(self, value):
+        assert(isinstance(value, float))
+        self.log('SINR = %.1f dBm' % value)
+
+    def set_rsrq(self, value):
+        assert(isinstance(value, float))
+        self.log('RSRQ = %.1f dBm' % value)
+
     def set_srv_mode(self, mode):
-        assert(isinstance(mode, (str, None)))
+        assert(isinstance(mode, int))
 
         if self.srv_mode != mode:
             self.srv_mode = mode
-            self.log('Service mode changed to %s' % mode)
+            self.log('Service mode changed to %d' % mode)
+
+    def get_srv_mode(self):
+        modes = {0: 'disconnected', 1: 'AMPS', 2: 'CDMA', 3: 'GPRS', 4: 'HDR', 5: 'WCDMA', 6: 'GPS', 7: 'GSM/WCDMA', 8: 'CDMA/HDR', 9: 'LTE', 15: 'TS-SCDMA'}
+        return modes.get(self.srv_mode)
 
     def set_srv_submode(self, submode):
-        assert(isinstance(submode, (str, None)))
+        assert(isinstance(submode, int))
 
         if self.srv_submode != submode:
             self.srv_submode = submode
-            self.log('Service submode changed to %s' % submode)
+            self.log('Service submode changed to %d' % submode)
+
+    def get_srv_submode(self):
+        submodes = {0: 'no service', 1: 'GSM', 2: 'GPRS', 3: 'EDGE', 4: 'WCDMA', 5: 'HSDPA', 6: 'HSUPA', 7: 'HSDPA+HSUPA', 8: 'TS-CDMA', 9: 'HSPA+', 17: 'HSPA+ (64QAM)', 18: 'HSPA+ (MIMO)'}
+        return submodes.get(self.srv_submode)
 
     def set_title(self):
         if self.rssi is not None:
@@ -404,14 +441,16 @@ class Monitor(object):
         [3] 10 = RSSI
         [4] 4 = antenna level (?)
         [5] 0x7C8348 = Cell ID
+        [6] ???
         """
 
-        m = re.match(r'^\^ANQUERY:(\d+),(\d+),(\d+),(\d+),(.+)$', lines[0])
+        m = re.match(r'^\^ANQUERY:(.+)$', lines[0])
         if m is not None:
-            self.set_rscp(- int(m.group(1)))
-            self.set_ecio(int(m.group(2)))
-            self.set_rssi(int(m.group(3)))
-            self.set_cellid(str(m.group(5)))
+            values = m.group(1).split(',')
+            self.set_rscp(- int(values[0]))
+            self.set_ecio(float(values[2]))
+            self.set_rssi(int(values[3]))
+            self.set_cellid(str(values[4]))
         else:
             self.rssi_ts = time.time()
             self.log("bad anquery response")
@@ -492,14 +531,11 @@ class Monitor(object):
             self.roaming = roam_status == 1
             self.srv_domain = srv_domain
 
-            modes = {0: 'disconnected', 1: 'AMPS', 2: 'CDMA', 3: 'GPRS', 4: 'HDR', 5: 'WCDMA', 6: 'GPS', 7: 'GSM/WCDMA', 8: 'CDMA/HDR', 15: 'TS-SCDMA'}
-            self.set_srv_mode(modes.get(sys_mode))
+            self.set_srv_mode(int(sys_mode))
+            self.set_srv_submode(int(sys_submode))
 
             states = {0: 'invalid or locked', 1: 'valid', 2: 'voice only', 3: 'data only', 4: 'voice + data', 255: 'missing'}
             self.sim_status = states.get(sim_state, 'unknown')
-
-            submodes = {0: 'no service', 1: 'GSM', 2: 'GPRS', 3: 'EDGE', 4: 'WCDMA', 5: 'HSDPA', 6: 'HSUPA', 7: 'HSDPA+HSUPA', 8: 'TS-CDMA', 9: 'HSPA+', 17: 'HSPA+ (64QAM)', 18: 'HSPA+ (MIMO)'}
-            self.set_srv_submode(submodes.get(sys_submode))
 
     def on_csms(self, lines):
         """Check if device supports SMS.
@@ -566,6 +602,8 @@ class Monitor(object):
                 # self.log("[7] dl speed limit is %.2f kbps" % s)
 
     def on_cgpaddr(self, lines):
+        if not lines:
+            return
         m = re.match(r'^\+CGPADDR: 1,"([0-9.]+)"$', lines[0])
         if m is not None:
             addr = m.group(1)
@@ -574,7 +612,51 @@ class Monitor(object):
                 self.log('IP address changed to %s' % addr)
 
     def on_rssi_unsolicited(self, value):
-        self.set_rssi(int(value))
+        if not self.have_hcsq:
+            self.set_rssi(int(value))
+        else:
+            self.log('old-style rssi=%d report ignored.' % int(value))
+
+    def on_hcsq_unsolicited(self, value):
+        values = value.split(',')
+
+        self.have_hcsq = True
+
+        if values[0] == '"WCDMA"':
+            if len(values) >= 2:
+                dbm = -121 + int(values[1])
+                val = (113 + dbm) / 2
+                self.set_rssi(val)
+
+            if len(values) >= 3:
+                self.set_rscp(-121 + int(values[2]))
+
+            if len(values) >= 4:
+                self.set_ecio(-32.5 + float(values[3]) * 0.5)
+
+            self.set_srv_mode(5)
+
+        elif values[0] == '"LTE"':
+            # ^HCSQ:"LTE",40,36,146,32
+            if len(values) >= 2:
+                dbm = -121 + int(values[1])
+                val = (113 + dbm) / 2
+                self.set_rssi(val)
+
+            if len(values) >= 3:
+                self.set_rscp(-141 + int(values[2]))
+
+            if len(values) >= 4:
+                self.set_sinr(-20.0 + float(values[3]) * 0.2)
+
+            elif len(values) >= 5:
+                self.set_rsrq(-20.0 + float(values[4]) * 0.5)
+
+            self.set_srv_mode(9)
+
+    def on_mode_urc(self, mode, submode):
+        self.set_srv_mode(int(mode))
+        self.set_srv_submode(int(submode))
 
     def on_cops(self, lines):
         """Operator list response.
@@ -588,6 +670,8 @@ class Monitor(object):
         m = re.match(r'^\+COPS: (.+)$', lines[0])
         if m is not None:
             cells = m.group(1).split(',')
+            if len(cells) < 2:
+                return
             value = cells[2]
             if value.isdigit():
                 self.operator = OPERATORS.get(int(value))
@@ -598,8 +682,11 @@ class Monitor(object):
         """Handle the operator list.
 
         Example command: +COPS: (1,"MegaFon RUS","MegaFon","25002",2),(2,"MTS BY","MTS","25702",2),(1,"MTS-RUS","MTS","25001",2),(1,"TELE2 RU","TELE2 RU","25020",2),,(0,1,2,3,4),(0,1,2)
-        Meaning: (status, symbolic name, display name, code, hz)
+        +COPS: (2,"MegaFon RUS","MegaFon","25002",2),(1,"MegaFon RUS","MegaFon","25002",7),(1,"MTS RUS","MTS RUS","25001",7),(1,"MTS RUS","MTS RUS","25001",2),(1,"","","25011",7),(1,"BY VELCOM","VELCOM","25701",2),(1,")
+
+        Meaning: (status, symbolic name, display name, code, AcT)
         Status: 1 = available, 2 = current (connected).
+        AcT: 0 = GSM, 2 = UTRAN, 7 = E-UTRAN.
         """
         self.operator = None
         self.oplist = {}
@@ -777,7 +864,12 @@ class Monitor(object):
             m = re.match(pattern, line)
             if m:
                 args = m.groups()
-                handler(*args)
+                try:
+                    handler(*args)
+                except:
+                    print(line)
+                    print(args)
+                    raise
 
         for m in re.findall(r'^\+ZOPERTER: ', line):
             # Ping the idle link.
@@ -786,6 +878,8 @@ class Monitor(object):
 
         callback(r'^\^DSFLOWRPT:([0-9A-F,]+)$', self.on_dsflowrpt)
         callback(r'^\^RSSI: (\d+)$', self.on_rssi_unsolicited)
+        callback(r'^\^HCSQ:(.+$)$', self.on_hcsq_unsolicited)
+        callback(r'^\^MODE: (\d+),(\d+)$', self.on_mode_urc)
 
     def on_zsec(self, lines):
         for line in lines:
@@ -819,6 +913,8 @@ class Monitor(object):
         self.queue('AT^SYSINFO', None, self.on_sysinfo)
         self.queue('AT^SYSINFOEX', None, self.on_sysinfo)
         self.queue('AT^SYSCFG?')
+        self.queue('AT^CURC=1')
+        self.queue('AT^DSFLOWRPT=1')
 
         # Enable unsolicited registration info: status, location etc.
         self.queue('AT+CREG=2', None, None, '+CREG')
@@ -837,7 +933,7 @@ class Monitor(object):
         # Prefer 3G.
         self.queue('AT+ZSNT=2,0,0', None, self.on_dummy, '+ZTEST')
         self.queue('AT+ZPAS?', None, None, '+ZTEST')
-        self.queue('AT^SYSCFG=14,2,3fffffff,0,1', None, self.on_dummy, '^SYSCFG')
+        #self.queue('AT^SYSCFG=14,2,3fffffff,0,1', None, self.on_dummy, '^SYSCFG')
 
         # Manual registration:
         #self.queue('AT+COPS=1,2,"25001",2', None, self.on_dummy, '+COPS')
@@ -899,7 +995,11 @@ class Monitor(object):
                 if line in self.current_command[1] or line.startswith('+CME ERROR: '):  # OK, ERROR, etc.
                     result = self.response_queue
                     self.response_queue = []
-                    self.current_command[2](result)
+                    try:
+                        self.current_command[2](result)
+                    except:
+                        print(result)
+                        raise
                     self.current_command = None
                 else:
                     self.response_queue.append(line)
