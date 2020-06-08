@@ -25,6 +25,7 @@ OPERATOR_ID = None
 RSSI_LOG = "~/.rssi.log"
 RSSI_LAST = "~/.rssi.last"
 MODEM_LOG = '~/modem.log.%Y%m%d'
+MODEM_LOG_LINK = '~/modem.log'
 MODEM_LAST = os.path.expanduser("~/modem-last.txt")
 
 OPERATORS = {
@@ -155,6 +156,12 @@ class Monitor(object):
             self.mlog_name = fname
             self.mlog.close()
             self.mlog = open(self.mlog_name, 'a')
+
+            link = os.path.expanduser(MODEM_LOG_LINK)
+            if os.path.exists(link):
+                os.unlink(link)
+
+            os.symlink(self.mlog_name, link)
 
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         self.mlog.write("%s %s\n" % (ts, message.strip()))
