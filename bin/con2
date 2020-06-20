@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# vim: set fileencoding=utf-8:
+
+import glob
+import logging
+import os
+import re
+import serial
+import subprocess
+import time
+import toml
+import traceback
+
+
+VALID_MODEM_DEVICES = [
+    '12d1:1506',
+]
+
+SWITCH_DEVICES = [
+    '12d1:14fe',
+    '12d1:1f01',
+]
+
+
+class Connector(object):
+    def __init__(self):
+        # Bus id for hard reset.
+        self.busnum = None
+        self.devnum = None
+
+        # Serial devices.
+        self.tty_main = None
+        self.tty_control = None
+
+        # Valid modem device ids, in form "vendor:product".
+        self.valid_devices = []
+
+        # Ids of modems in wrong modes, in form "vendor:product".
+        self.switch_devices = []
+
+        # ICCID to ISP name map.
+        self.iccid_map = {}
+
+    def run(self):
+        self.read_config()
+        dev = self.find_modem()
+        self.setup_modem(dev)
+        self.connect()
+
+    def read_config(self):
+        path = os.path.expanduser('~/.config/con2.toml')
+        if not os.path.exists(path):
+            raise RuntimeError('Config file %s not found.' % path)
+
+        config = toml.load(path)
+        self.valid_devices = config['valid_devices']
+        self.switch_devices = config['switch_devices']
+        self.iccid_map = config['iccid_map']
+
+        logging.info('Read config from %s' % path)
+
+    def find_modem(self):
+        """Returns modem device.
+
+        Looks for a recognized USB device.
+        Switches suspicious devices as necessary.
+        """
+        notify = True
+
+        while True:
+            devices = self.list_all_devices()
+
+            for dev in devices:
+                if dev['usbid'] in self.valid_devices and len(dev['ttys']) > 0:
+                    return dev
+
+            for dev in devices:
+                if dev['usbid'] in self.switch_devices:
+                    vendor, product = dev['usbid'].split(':', 1)
+                    run(['usb_modeswitch', '-J', '-v', vendor, '-p', product])
+
+            if notify:
+                logging.info('Waiting for modem devices...')
+                notify = False
+
+            time.sleep(1)
+
+    def setup_modem(self, dev):
+        self.busnum = dev['busnum']
+        self.devnum = dev['devnum']
+
+        self.tty_main = dev['ttys'][0]
+        self.tty_control = dev['ttys'][1] if len(dev['ttys']) > 1 else None
+
+        logging.info('Using device with usbid %s as %s' % (dev['usbid'], self.tty_main))
+        logging.info('Hard reset with: usbreset /dev/bus/usb/%03d/%03d' % (self.busnum, self.devnum))
+
+        if os.path.exists('/dev/modem'):
+            os.unlink('/dev/modem')
+        os.symlink(self.tty_main, '/dev/modem')
+
+    def connect(self):
+        """Connect to the selected device."""
+        isp = self.get_isp()
+
+        p = subprocess.Popen(['/usr/sbin/pppd', 'nodetach', 'call', isp], stdout=subprocess.PIPE)
+
+        for line in p.stdout:
+            logging.info('pppd: %s' % line.decode('utf-8').rstrip())
+
+        p.wait()
+
+        if p.returncode == 0:
+            log.info('pppd finished correctly.')
+        elif p.returncode == 2:
+            logging.error('pppd reports config file error (exit code 2)')
+        elif p.returncode == 6:
+            logging.error('pppd reports another instance (exit code 6)')
+        elif p.returncode == 8:
+            logging.error('pppd exit code 8, resetting the modem.')
+            self.reset_modem()
+        else:
+            logging.error('pppd failed with exit code %d' % e.args[0])
+
+    def get_isp(self):
+        """Returns isp (peer) name.
+        TODO: get sim ID, map to a dictionary.
+        """
+        output = self.chat('AT^ICCID?')
+
+        match = re.search(r'\^ICCID: ([0-9a-f]+)', output)
+        if not match:
+            raise RuntimeError('Bad response, cannot identify SIM card.')
+
+        iccid = match.group(1)
+
+        isp = self.iccid_map.get(iccid)
+        if isp is not None:
+            logging.info('Sim card %s found, using ISP %s.' % (iccid, isp))
+            return isp
+
+        logging.warning('Sim card %s unknown, add to config file.' % iccid)
+        raise RuntimeError('SIM card unknown')
+
+    def reset_modem(self):
+        output = self.chat('AT^RESET')
+
+    def list_all_devices(self):
+        """Returns a list of USB devices with keys: usbid, busnum, devnum."""
+        res = []
+
+        for vpath in glob.glob('/sys/bus/usb/devices/*/idVendor'):
+            folder = os.path.dirname(vpath)
+
+            vendor = self.read_file(folder + '/idVendor')
+            product = self.read_file(folder + '/idProduct')
+            busnum = int(self.read_file(folder + '/busnum'))
+            devnum = int(self.read_file(folder + '/devnum'))
+
+            # TODO: find out how the fuck to know TTY types (control, ppp, etc).
+            ttys = ['/dev/' + os.path.basename(t) for t in glob.glob(folder + '/*/ttyUSB*')]
+            ttys = sorted(ttys, key=lambda s: int(s[11:]))
+
+            res.append({
+                'usbid': vendor + ':' + product,
+                'busnum': busnum,
+                'devnum': devnum,
+                'ttys': ttys,
+            })
+
+        return res
+
+    def read_file(self, path):
+        with open(path, 'r') as f:
+            return f.read().strip()
+
+    def chat(self, command):
+        """Send a command to the modem, return response up to first OR."""
+        logging.info('Sending %s to %s' % (command, self.tty_main))
+
+        command += '\r\n\r\n'
+
+        ser = serial.Serial(self.tty_main, 57600, timeout=5, rtscts=True, dsrdtr=True)
+        ser.write(command.encode('utf-8'))
+        ser.flush()
+
+        response = ''
+
+        while True:
+            line = ser.readline(10240).decode('utf-8')
+
+            if line.strip() == 'OK':
+                ser.close()
+                return response
+
+            response += line
+
+            if line.strip():
+                logging.debug('modem response: %s' % line.strip())
+
+
+def setup_logging():
+    logging.basicConfig(filename='connect.log', level=logging.DEBUG, format='%(asctime)-15s %(levelname)s %(message)s')
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.DEBUG)
+    console.setFormatter(logging.Formatter('%(asctime)-15s %(levelname)s %(message)s'))
+    logging.getLogger('').addHandler(console)
+
+
+def main():
+    setup_logging()
+
+    while True:
+        try:
+            conn = Connector()
+            conn.run()
+        except Exception as e:
+            logging.error('Connector failed: %s' % e)
+            logging.error(traceback.format_exc())
+
+        logging.debug('Waiting 5 seconds.')
+        time.sleep(5)
+
+
+if __name__ == '__main__':
+    main()

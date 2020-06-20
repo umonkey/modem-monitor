@@ -96,8 +96,8 @@ class Monitor(object):
 
         self.mode = None
         self.srv_domain = None
-        self.srv_mode = None
-        self.srv_submode = None
+        self.srv_mode = 0
+        self.srv_submode = 0
         self.bytes_in = None
         self.bytes_out = None
         self.dev_manuf = None
@@ -118,6 +118,7 @@ class Monitor(object):
         self.rssi_log = []
         self.simlock = None
         self.sim_status = None
+        self.sim_id = None
         self.can_read_sms = False
         self.can_send_sms = False
         self.can_read_cbs = False
@@ -129,8 +130,8 @@ class Monitor(object):
 
         self.have_hcsq = False
 
-        self.mlog_name = self.get_log_name()
-        self.mlog = open(self.mlog_name, 'a')
+        self.mlog = None
+        self.mlog_name = None
 
         self.reopen()
 
@@ -154,7 +155,8 @@ class Monitor(object):
         fname = self.get_log_name()
         if fname != self.mlog_name:
             self.mlog_name = fname
-            self.mlog.close()
+            if self.mlog is not None:
+                self.mlog.close()
             self.mlog = open(self.mlog_name, 'a')
 
             link = os.path.expanduser(MODEM_LOG_LINK)
@@ -232,6 +234,8 @@ class Monitor(object):
             parts.append('data only')
         elif self.srv_domain == 3:
             parts.append('voice + data')
+        if self.sim_id is not None:
+            parts.append('id=%s' % self.sim_id)
         text += "SIM status   : %s\n" % ', '.join(parts)
 
         parts = []
@@ -245,8 +249,8 @@ class Monitor(object):
             parts.append("+sms")
         if self.can_read_cbs:
             parts.append("+cb")
-        if self.srv_mode and self.srv_submode:
-            parts.append('%s / %s' % (self.get_srv_mode(), self.get_srv_submode()))
+        if self.srv_mode:
+            parts.append(self.get_mode())
         elif self.srv_mode:
             parts.append(self.get_srv_mode())
         text += "Network      : %s\n" % ", ".join(parts)
@@ -364,7 +368,7 @@ class Monitor(object):
             self.log('RSSI changed to %u dBm (%u)' % (-113 + rssi * 2, rssi))
 
             with open(os.path.expanduser(RSSI_LOG), "a") as f:
-                f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), rssi))
+                f.write("%s %s %s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), rssi, self.srv_mode, self.srv_submode))
 
             with open(os.path.expanduser(RSSI_LAST), "wb") as f:
                 f.write(str(rssi))
@@ -392,6 +396,12 @@ class Monitor(object):
     def set_rsrq(self, value):
         assert(isinstance(value, float))
         self.log('RSRQ = %.1f dBm' % value)
+
+    def get_mode(self):
+        if self.srv_mode == 9:
+            return '%s' % self.get_srv_mode()
+        else:
+            return '%s / %s' % (self.get_srv_mode(), self.get_srv_submode())
 
     def set_srv_mode(self, mode):
         assert(isinstance(mode, int))
@@ -788,6 +798,24 @@ class Monitor(object):
 
         self.go_ahead()
 
+    def on_iccid(self, lines):
+        """Gets SIM id, also written on the card.
+        """
+        sim_id = None
+
+        for line in lines:
+            if line.startswith('^ICCID: '):
+                sim_id = line[8:]
+
+        self.sim_id = sim_id
+
+        fn = os.path.expanduser('~/iccid.txt')
+        if os.path.exists(fn) and sim_id is None:
+            os.unlink(fn)
+        else:
+            with open(fn, 'w') as f:
+                f.write(sim_id.encode('utf-8'))
+
     def on_creg(self, lines):
         """Handle +CREG: registration status.
         http://m2msupport.net/m2msupport/atcreg-network-registration/
@@ -927,6 +955,11 @@ class Monitor(object):
         self.queue('AT+CREG=2', None, None, '+CREG')
         self.queue('AT+CURC=1', None, None, '+CURC')
 
+        # Request sim id.
+        self.queue('AT^ICCID?', None, self.on_iccid, '^ICCID')
+        self.queue('AT+CRSM', None, None, '+CRSM')
+        self.queue('AT+CSIM', None, None, '+CSIM')
+
         # Check SIM lock.
         self.queue('AT+ZSEC?', None, self.on_zsec, '+ZTEST')
 
@@ -938,9 +971,15 @@ class Monitor(object):
         self.queue('AT+COPS?', None, self.on_cops, '+COPS')  # query operators
 
         # Prefer 3G.
-        self.queue('AT+ZSNT=2,0,0', None, self.on_dummy, '+ZTEST')
-        self.queue('AT+ZPAS?', None, None, '+ZTEST')
+        #self.queue('AT+ZSNT=2,0,0', None, self.on_dummy, '+ZTEST')
+        #self.queue('AT+ZPAS?', None, None, '+ZTEST')
         #self.queue('AT^SYSCFG=14,2,3fffffff,0,1', None, self.on_dummy, '^SYSCFG')
+
+        self.queue('AT^SYSCFG?')
+        self.queue('AT^SYSCFGEX?')
+
+        # Prefer 4G.
+        self.queue('AT^SYSCFGEX="0302",3FFFFFFF,0,4,7FFFFFFFFFFFFFFF,,', None, None, '^SYSCFGEX')
 
         # Manual registration:
         #self.queue('AT+COPS=1,2,"25001",2', None, self.on_dummy, '+COPS')
