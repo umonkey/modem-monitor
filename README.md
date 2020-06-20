@@ -123,3 +123,16 @@ $ bin/con2
 2020-06-20 21:57:57,269 INFO pppd: Script /etc/ppp/ip-up started (pid 4442)
 2020-06-20 21:57:57,271 INFO pppd: Script /etc/ppp/ip-up finished (pid 4442), status = 0x0
 ```
+
+I normally run this script on an Alpine Linux server, using supervisord, with a config like this:
+
+```
+[program:pppd]
+command = /root/bin/con2
+directory = /root
+autorestart = true
+startsecs = 0
+startretries = 1000000
+restartpause = 5
+user = root
+```
