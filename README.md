@@ -1,21 +1,18 @@
-# RSSI monitor
+# Modem tools
 
-This is a python script that monitors your USB modem status.
-Displays signal strength, data flow, network status and other options.
-It uses the additional command port and doesn't block the normal modem work.
+Here I have two little scripts:
 
-Usage is, in any order:
-
-- Connect to the internet.
-- Run this script.
+1. `bin/modem-monitor`, which uses the control connection to display (and log) runtime modem information.
+2. `bin/con2`, to keep the connection up.
 
 
-## Detecting the modem
+## Modem monitor
 
-It looks up in `/sys/bus` for something that uses the option1 driver.  You know a better way?  Tell me.
+The script `bin/modem-monitor` finds the proper `ttyUSB` device, reads data
+from it and display it.  Uses the additional port, so works well with `pppd`
+etc.
 
-
-## Example output
+Example output:
 
 ```
 Path         : /dev/ttyUSB4
@@ -42,6 +39,15 @@ Here you can see:
 - Operators (needs to be started before connecting).
 - Traffic statistics, speed.
 - Last update (to be sure that it doesn't just hang).
+
+RSSI, network mode and ISP changes are logged into a separate file, which looks like this:
+
+```
+2020-06-20 21:34:27 19 9 4 25001
+2020-06-20 21:34:37 20 9 4 25001
+2020-06-20 21:34:47 17 9 4 25001
+2020-06-20 21:35:07 20 9 4 25001
+```
 
 
 ## Connection manager
