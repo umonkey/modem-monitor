@@ -120,7 +120,7 @@ class Connector(object):
             logging.error('pppd exit code 8, resetting the modem.')
             self.reset_modem()
         else:
-            logging.error('pppd failed with exit code %d' % e.args[0])
+            logging.error('pppd failed with exit code %d' % p.returncode)
 
     def get_isp(self):
         """Returns isp (peer) name.
